@@ -1,0 +1,47 @@
+[package]
+name = "rust-system-analyzer"
+version = "0.1.0"
+edition = "2021"
+authors = ["System Analyzer"]
+description = "A performant desktop application for monitoring system resources and detecting security risks"
+
+[[bin]]
+name = "rust-system-analyzer"
+path = "src/main.rs"
+
+[dependencies]
+# System monitoring
+sysinfo = "0.31"
+
+# GUI framework (egui ecosystem)
+eframe       = { version = "0.28", features = ["default_fonts", "glow"] }
+egui         = "0.28"
+egui_plot    = "0.28"
+egui_extras  = "0.28"
+
+# Database (SQLite bundled, ready for PostgreSQL switch)
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Error handling
+anyhow    = "1.0"
+thiserror = "1.0"
+
+# Serialization
+serde      = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Date / time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+log        = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
+strip         = true
+
+[profile.dev]
+opt-level = 1

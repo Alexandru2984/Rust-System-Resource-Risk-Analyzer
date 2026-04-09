@@ -1,0 +1,56 @@
+# ── Rust / Cargo ─────────────────────────────────────────────────────────────
+/target/
+# Cargo.lock is intentionally NOT ignored for binary crates.
+# Committing it ensures reproducible builds across machines and CI.
+# (Library crates typically do ignore it – binaries should not.)
+
+# Incremental compilation artefacts
+**/*.rs.bk
+*.pdb
+
+# ── IDE / Editor ─────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Runtime data ─────────────────────────────────────────────────────────────
+# SQLite database files created by the application at runtime
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+
+# Application log files
+*.log
+logs/
+
+# ── Environment / Secrets ─────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+secrets.toml
+
+# ── OS artefacts ─────────────────────────────────────────────────────────────
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux
+*~
+.directory
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+dist/
+*.zip
+*.tar.gz
