@@ -24,11 +24,9 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 
 # Error handling
 anyhow    = "1.0"
-thiserror = "1.0"
 
 # Serialization
 serde      = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 
 # Date / time
 chrono = { version = "0.4", features = ["serde"] }
@@ -36,6 +34,15 @@ chrono = { version = "0.4", features = ["serde"] }
 # Logging
 log        = "0.4"
 env_logger = "0.11"
+
+# TOML config persistence
+toml = "0.8"
+
+# Faster non-poisoning mutexes
+parking_lot = "0.12"
+
+# Lock-free latest snapshot reads
+arc-swap = "1.7"
 
 [profile.release]
 opt-level     = 3

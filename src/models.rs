@@ -98,15 +98,7 @@ pub struct ProcessInfo {
     pub name: String,
     pub cpu_usage_percent: f32,
     pub memory_bytes: u64,
-    pub virtual_memory_bytes: u64,
     pub status: String,
-    pub exe_path: Option<String>,
-}
-
-impl ProcessInfo {
-    pub fn memory_mb(&self) -> f64 {
-        self.memory_bytes as f64 / (1024.0 * 1024.0)
-    }
 }
 
 // ─── Temperature ─────────────────────────────────────────────────────────────
@@ -131,6 +123,24 @@ pub struct SystemSnapshot {
     pub processes: Vec<ProcessInfo>,
     pub temperatures: Vec<TemperatureReading>,
     pub os_info: OsInfo,
+}
+
+// ─── Lightweight snapshot for DB serialisation ────────────────────────────────
+//
+// Avoids cloning the full `SystemSnapshot` (500+ processes, all interfaces, etc.)
+// just to persist the handful of aggregate fields the DB actually needs.
+
+#[derive(Debug, Clone)]
+pub struct SnapshotForDb {
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub cpu_usage: f32,
+    pub memory: MemoryMetrics,
+    /// Aggregate RX bytes across all interfaces for this refresh cycle.
+    pub net_rx_bytes: u64,
+    /// Aggregate TX bytes across all interfaces for this refresh cycle.
+    pub net_tx_bytes: u64,
+    /// Top-N processes by CPU usage, already sorted and truncated before sending.
+    pub top_processes: Vec<ProcessInfo>,
 }
 
 // ─── Risk Alerts ─────────────────────────────────────────────────────────────

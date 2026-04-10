@@ -1,0 +1,21 @@
+monitoring_interval_ms = 2000
+db_log_interval_secs = 30
+database_path = "system_monitor.db"
+config_path = "system_analyzer.toml"
+max_history_points = 60
+max_alerts = 500
+
+[thresholds]
+cpu_warning_percent = 75.0
+cpu_critical_percent = 90.0
+memory_warning_percent = 75.0
+memory_critical_percent = 90.0
+disk_warning_percent = 85.0
+disk_critical_percent = 95.0
+temp_warning_celsius = 80.0
+temp_critical_celsius = 95.0
+process_cpu_warning_percent = 50.0
+process_memory_warning_mb = 1024
+memory_leak_samples = 5
+network_bytes_per_sec_threshold = 104857600
+dedup_window_secs = 60

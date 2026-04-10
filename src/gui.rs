@@ -6,19 +6,19 @@
 //!  - **Alerts**     – filterable alert feed with acknowledge support
 //!  - **Settings**   – runtime-editable thresholds and intervals
 //!
-//! The GUI owns an `Arc<Mutex<AppState>>` that it shares with the background
-//! monitor thread.  The lock is acquired once per frame with `try_lock` to
-//! avoid blocking the render loop.
+//! The GUI owns an `Arc<SharedState>` that it shares with the background
+//! monitor thread.  The latest snapshot is read lock-free via `ArcSwapOption`,
+//! while mutable UI state is guarded by a lightweight `parking_lot::Mutex`.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use eframe::egui::{self, Color32, RichText, ScrollArea, Ui};
 use egui_extras::{Column, TableBuilder};
 use egui_plot::{Line, Plot, PlotPoints};
 
-use crate::models::{RiskAlert, RiskLevel};
-use crate::AppState;
+use crate::models::{RiskAlert, RiskLevel, SystemSnapshot};
+use crate::{AppState, SharedState};
 
 // ─── Tabs ────────────────────────────────────────────────────────────────────
 
@@ -43,7 +43,7 @@ enum ProcSort {
 // ─── MonitorApp ──────────────────────────────────────────────────────────────
 
 pub struct MonitorApp {
-    state: Arc<Mutex<AppState>>,
+    state: Arc<SharedState>,
     tab: Tab,
     proc_filter: String,
     proc_sort: ProcSort,
@@ -53,7 +53,7 @@ pub struct MonitorApp {
 }
 
 impl MonitorApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, state: Arc<Mutex<AppState>>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, state: Arc<SharedState>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         Self {
             state,
@@ -72,9 +72,10 @@ impl eframe::App for MonitorApp {
         // Repaint every 500 ms so graphs stay live without pegging the CPU.
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
 
-        let mut state = match self.state.try_lock() {
-            Ok(s) => s,
-            Err(_) => return, // skip frame – monitor thread holds the lock
+        let latest_snapshot = self.state.latest_snapshot.load_full();
+        let mut state = match self.state.ui.try_lock() {
+            Some(s) => s,
+            None => return, // skip frame – monitor thread holds the lock
         };
 
         // ── Top navigation bar ────────────────────────────────────────────────
@@ -144,11 +145,12 @@ impl eframe::App for MonitorApp {
 
         // ── Central panel ─────────────────────────────────────────────────────
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
-            Tab::Dashboard => show_dashboard(ui, &state),
+            Tab::Dashboard => show_dashboard(ui, &state, latest_snapshot.as_deref()),
             Tab::Processes => {
                 show_processes(
                     ui,
                     &state,
+                    latest_snapshot.as_deref(),
                     &mut self.proc_filter,
                     &mut self.proc_sort,
                     &mut self.proc_sort_asc,
@@ -171,9 +173,9 @@ impl eframe::App for MonitorApp {
 // Dashboard
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn show_dashboard(ui: &mut Ui, state: &AppState) {
+fn show_dashboard(ui: &mut Ui, state: &AppState, snap: Option<&SystemSnapshot>) {
     ScrollArea::vertical().show(ui, |ui| {
-        let Some(snap) = &state.latest_snapshot else {
+        let Some(snap) = snap else {
             ui.centered_and_justified(|ui| {
                 ui.label(RichText::new("⏳  Collecting first snapshot…").heading());
             });
@@ -429,11 +431,12 @@ fn show_dashboard(ui: &mut Ui, state: &AppState) {
 fn show_processes(
     ui: &mut Ui,
     state: &AppState,
+    snap: Option<&SystemSnapshot>,
     filter: &mut String,
     sort: &mut ProcSort,
     sort_asc: &mut bool,
 ) {
-    let Some(snap) = &state.latest_snapshot else {
+    let Some(snap) = snap else {
         ui.label("No data yet.");
         return;
     };
@@ -463,9 +466,11 @@ fn show_processes(
         ProcSort::Pid => procs.sort_by_key(|p| p.pid),
         ProcSort::Name => procs.sort_by(|a, b| a.name.cmp(&b.name)),
         ProcSort::Cpu => procs.sort_by(|a, b| {
+            // NaN-safe: sysinfo can return NaN on the first sample or for
+            // zombie processes.  Treat NaN as equal to avoid a panic.
             b.cpu_usage_percent
                 .partial_cmp(&a.cpu_usage_percent)
-                .unwrap()
+                .unwrap_or(std::cmp::Ordering::Equal)
         }),
         ProcSort::Memory => procs.sort_by_key(|p| std::cmp::Reverse(p.memory_bytes)),
     }

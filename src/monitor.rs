@@ -1,11 +1,11 @@
 //! System metrics collection via the `sysinfo` crate.
 //! Abstracts OS differences behind a single `SystemMonitor` struct.
 
-use std::collections::HashMap;
-
 use anyhow::Result;
 use chrono::Utc;
-use sysinfo::{Components, Disks, Networks, System};
+use sysinfo::{
+    Components, CpuRefreshKind, Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System,
+};
 
 use crate::models::{
     CpuMetrics, DiskMetrics, MemoryMetrics, NetworkInterfaceMetrics, OsInfo, ProcessInfo,
@@ -49,10 +49,7 @@ pub struct SystemMonitor {
     networks: Networks,
     disks: Disks,
     components: Components,
-    /// Previous bytes-received per interface for delta calculation.
-    prev_rx: HashMap<String, u64>,
-    /// Previous bytes-transmitted per interface for delta calculation.
-    prev_tx: HashMap<String, u64>,
+    sample_count: u64,
 }
 
 impl SystemMonitor {
@@ -71,17 +68,37 @@ impl SystemMonitor {
             networks: Networks::new_with_refreshed_list(),
             disks: Disks::new_with_refreshed_list(),
             components: Components::new_with_refreshed_list(),
-            prev_rx: HashMap::new(),
-            prev_tx: HashMap::new(),
+            sample_count: 0,
         }
     }
 
-    /// Refresh all subsystems and return a complete `SystemSnapshot`.
+    /// Refresh only the subsystems we actually read and return a complete
+    /// `SystemSnapshot`.
     pub fn collect_snapshot(&mut self) -> Result<SystemSnapshot> {
-        self.system.refresh_all();
+        self.sample_count += 1;
+
+        // Refresh only the data we consume instead of `refresh_all()`, which is
+        // significantly more expensive.
+        self.system
+            .refresh_cpu_specifics(CpuRefreshKind::new().with_cpu_usage());
+        self.system.refresh_memory();
+        self.system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            ProcessRefreshKind::new().with_cpu().with_memory(),
+        );
+
         self.networks.refresh();
         self.disks.refresh();
         self.components.refresh();
+
+        // Periodically refresh device/interface lists so hot-plug changes are
+        // eventually discovered without paying the list-refresh cost every cycle.
+        if self.sample_count % 30 == 0 {
+            self.networks.refresh_list();
+            self.disks.refresh_list();
+            self.components.refresh_list();
+            self.system.refresh_cpu_frequency();
+        }
 
         Ok(SystemSnapshot {
             timestamp: Utc::now(),
@@ -149,28 +166,21 @@ impl SystemMonitor {
 
     // ── Network ──────────────────────────────────────────────────────────────
 
-    fn collect_network(&mut self) -> Vec<NetworkInterfaceMetrics> {
+    fn collect_network(&self) -> Vec<NetworkInterfaceMetrics> {
+        // `received()` / `transmitted()` are already delta bytes since the last
+        // sysinfo refresh — no manual prev/curr tracking needed.
         self.networks
             .iter()
-            .map(|(name, data)| {
-                // `received()` / `transmitted()` are bytes since the last refresh
-                // (i.e., already delta values). We also compute totals.
-                let rx = data.received();
-                let tx = data.transmitted();
-                self.prev_rx.insert(name.clone(), rx);
-                self.prev_tx.insert(name.clone(), tx);
-
-                NetworkInterfaceMetrics {
-                    name: name.clone(),
-                    bytes_received: rx,
-                    bytes_transmitted: tx,
-                    total_bytes_received: data.total_received(),
-                    total_bytes_transmitted: data.total_transmitted(),
-                    packets_received: data.packets_received(),
-                    packets_transmitted: data.packets_transmitted(),
-                    errors_received: data.errors_on_received(),
-                    errors_transmitted: data.errors_on_transmitted(),
-                }
+            .map(|(name, data)| NetworkInterfaceMetrics {
+                name: name.clone(),
+                bytes_received: data.received(),
+                bytes_transmitted: data.transmitted(),
+                total_bytes_received: data.total_received(),
+                total_bytes_transmitted: data.total_transmitted(),
+                packets_received: data.packets_received(),
+                packets_transmitted: data.packets_transmitted(),
+                errors_received: data.errors_on_received(),
+                errors_transmitted: data.errors_on_transmitted(),
             })
             .collect()
     }
@@ -178,19 +188,20 @@ impl SystemMonitor {
     // ── Processes ────────────────────────────────────────────────────────────
 
     fn collect_processes(&self) -> Vec<ProcessInfo> {
-        self.system
-            .processes()
-            .iter()
-            .map(|(pid, p)| ProcessInfo {
+        let processes = self.system.processes();
+        let mut out = Vec::with_capacity(processes.len());
+
+        for (pid, p) in processes {
+            out.push(ProcessInfo {
                 pid: pid.as_u32(),
                 name: p.name().to_string_lossy().to_string(),
                 cpu_usage_percent: p.cpu_usage(),
                 memory_bytes: p.memory(),
-                virtual_memory_bytes: p.virtual_memory(),
                 status: format!("{:?}", p.status()),
-                exe_path: p.exe().map(|e| e.to_string_lossy().to_string()),
-            })
-            .collect()
+            });
+        }
+
+        out
     }
 
     // ── Temperatures ─────────────────────────────────────────────────────────

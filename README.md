@@ -19,10 +19,12 @@ and [`rusqlite`](https://github.com/rusqlite/rusqlite) for chronological logging
 | **Temperature Sensors** | Hardware component readings via sysinfo (where supported) |
 | **Real-time Graphs** | 2-minute ring-buffer history plots for CPU, RAM, and network |
 | **Process Table** | Searchable, sortable (PID / Name / CPU / Memory), risk-colour-coded |
-| **Risk Alerts** | Automatic detection of high CPU/RAM, memory leaks, critical temps, suspicious processes |
-| **Deduplication** | Alerts are deduplicated within a 60-second window per (category, subject) pair |
-| **Persistent Logging** | Snapshots and alerts stored in SQLite with configurable flush intervals |
+| **Risk Alerts** | Automatic detection of high CPU/RAM, memory leaks, critical temps, unusual network activity, and suspicious processes |
+| **Deduplication** | Alerts are deduplicated using a configurable `dedup_window_secs` per `(category, subject)` pair |
+| **Persistent Logging** | Snapshots and alerts stored in SQLite with configurable flush intervals, pruning, and WAL checkpoint support |
 | **Settings Panel** | All thresholds and intervals are editable at runtime without restart |
+| **Config Persistence** | Runtime configuration is loaded from and saved to a TOML file |
+| **Graceful Shutdown** | Background threads stop cleanly and checkpoint SQLite WAL on exit |
 
 ---
 
@@ -56,28 +58,30 @@ and [`rusqlite`](https://github.com/rusqlite/rusqlite) for chronological logging
 
 ## 🏗 Architecture
 
-The application uses **three dedicated threads** that communicate through shared state and
-channels, keeping the GUI always responsive:
+The application uses **three dedicated threads** and a split shared-state model so the GUI
+stays responsive even while monitoring and persistence continue in the background:
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │  main thread                                                          │
 │  eframe::run_native()  ─  egui render loop (~60 fps)                 │
-│  Reads AppState via Arc<Mutex<AppState>>   (try_lock per frame)       │
+│  Reads latest snapshot lock-free via ArcSwapOption<SystemSnapshot>    │
+│  Reads/writes UI state via Arc<parking_lot::Mutex<AppState>>          │
 └───────────────────────────────┬──────────────────────────────────────┘
-                                │  Arc<Mutex<AppState>>
+                                │  Arc<SharedState>
 ┌───────────────────────────────▼──────────────────────────────────────┐
 │  monitor thread                                                       │
 │  SystemMonitor::collect_snapshot()   every N ms (default 2 000 ms)   │
-│  RiskAnalyzer::analyse()  →  push alerts + snapshot into AppState     │
-│  Forward DbMessage to db thread via bounded mpsc channel (cap 64)     │
+│  RiskAnalyzer::analyse(..., interval_ms)                             │
+│  Stores latest snapshot in ArcSwapOption                             │
+│  Updates UI state + forwards DbMessage through bounded channel       │
 └───────────────────────────────┬──────────────────────────────────────┘
                                 │  mpsc::SyncSender<DbMessage>
 ┌───────────────────────────────▼──────────────────────────────────────┐
 │  database thread                                                      │
 │  Owns rusqlite::Connection (not Send – lives entirely in this thread) │
-│  insert_snapshot()  /  insert_alert()   on each DbMessage             │
-│  Prunes old rows on startup (keeps last 10 000 entries)               │
+│  insert_snapshot() / insert_alert() on each DbMessage                │
+│  Prunes old logs + alerts and performs WAL checkpoint on shutdown    │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -85,13 +89,12 @@ channels, keeping the GUI always responsive:
 
 ```
 src/
-├── main.rs        Entry point, AppState, thread orchestration
-├── models.rs      All shared data structures (Snapshot, Alert, Metrics…)
-├── config.rs      AppConfig + AlertThresholds with Default impl
-├── errors.rs      Centralised AppError (thiserror) + AppResult alias
-├── monitor.rs     SystemMonitor wrapping sysinfo; detect_os()
-├── database.rs    Database struct – SQLite schema + CRUD helpers
-├── risk.rs        RiskAnalyzer – six detection algorithms
+├── main.rs        Entry point, SharedState, thread orchestration, graceful shutdown
+├── models.rs      Shared data structures (Snapshot, Alert, Metrics, SnapshotForDb)
+├── config.rs      AppConfig + AlertThresholds + TOML load/save support
+├── monitor.rs     SystemMonitor wrapping sysinfo with granular refreshes
+├── database.rs    SQLite schema, transactions, pruning, WAL checkpoint helpers
+├── risk.rs        RiskAnalyzer + deduplication + PID-reuse-safe leak detection + tests
 └── gui.rs         MonitorApp (eframe::App) – four panels
 ```
 
@@ -105,14 +108,15 @@ src/
 | **High Global Memory** | `ram_used% ≥ memory_warning_percent` |
 | **High CPU Process** | `process.cpu_usage ≥ process_cpu_warning_percent` |
 | **High Memory Process** | `process.rss_mb ≥ process_memory_warning_mb` |
-| **Memory Leak** | Last N consecutive samples for a PID are strictly increasing |
+| **Memory Leak** | Last N consecutive samples for the same `(pid, process_name)` are strictly increasing |
 | **Critical Temperature** | `sensor_temp ≥ min(hw_critical, config_critical)` |
 | **Disk Space Low** | `mount_used% ≥ disk_warning_percent` |
-| **Unusual Network** | `bytes_per_refresh / interval_secs ≥ threshold` |
-| **Suspicious Process** | Name contains any of 18 known-malicious patterns (xmrig, mimikatz, netcat…) |
+| **Unusual Network** | `(bytes_per_refresh / monitoring_interval_ms) ≥ threshold` |
+| **Suspicious Process** | Split between **Critical** malware-like indicators and **Medium** dual-use tooling (e.g. `nmap`) |
 
-All algorithms include a **60-second deduplication window** per `(category, subject)` pair
-to avoid alert floods.
+All algorithms include a configurable deduplication window per `(category, subject)` pair
+to avoid alert floods. Internal dedup and per-process history maps are also cleaned up
+periodically to prevent unbounded growth on long-running systems.
 
 ---
 
@@ -156,7 +160,12 @@ CREATE TABLE risk_alerts (
 ```
 
 The database is created automatically in the working directory as `system_monitor.db`.
-WAL journal mode is enabled for better concurrent read performance.
+
+Additional implementation details:
+- `PRAGMA foreign_keys = ON` is enabled so `ON DELETE CASCADE` works correctly
+- WAL journal mode is enabled for better concurrent read performance
+- old `system_logs` and `risk_alerts` rows are pruned periodically
+- a WAL checkpoint is performed on clean shutdown
 
 ---
 
@@ -214,10 +223,16 @@ RUST_LOG=error   cargo run    # silent unless something breaks
 All thresholds and intervals can be changed **at runtime** from the **Settings** panel
 without restarting the application. Changes take effect on the next monitoring cycle.
 
+Configuration is also persisted to a TOML file (`system_analyzer.toml` by default):
+- loaded automatically at startup
+- saved automatically on clean exit
+
 | Setting | Default | Description |
 |---|---|---|
 | `monitoring_interval_ms` | `2 000` | How often metrics are collected |
 | `db_log_interval_secs` | `30` | How often snapshots are written to SQLite |
+| `database_path` | `system_monitor.db` | SQLite database file path |
+| `config_path` | `system_analyzer.toml` | TOML config file path |
 | `max_history_points` | `60` | Graph ring-buffer depth (60 × 2 s = 2 min) |
 | `max_alerts` | `500` | Maximum alerts kept in memory |
 | `cpu_warning_percent` | `75` | Global CPU warning threshold |
@@ -231,7 +246,8 @@ without restarting the application. Changes take effect on the next monitoring c
 | `process_cpu_warning_percent` | `50` | Per-process CPU threshold |
 | `process_memory_warning_mb` | `1 024` | Per-process RAM threshold (MB) |
 | `memory_leak_samples` | `5` | Consecutive growing samples to flag a leak |
-| `network_bytes_per_sec_threshold` | `100 MB/s` | Per-interface network alert |
+| `network_bytes_per_sec_threshold` | `100 MB/s` | Per-interface network alert threshold |
+| `dedup_window_secs` | `60` | Deduplication window for repeated alerts |
 
 ---
 
@@ -246,14 +262,33 @@ without restarting the application. Changes take effect on the next monitoring c
 | `egui_extras` | 0.28 | Sortable `TableBuilder` for the process list |
 | `rusqlite` | 0.31 | SQLite bindings (`bundled` feature – no system SQLite needed) |
 | `anyhow` | 1.0 | Ergonomic error propagation |
-| `thiserror` | 1.0 | Derive-based typed errors |
-| `serde` + `serde_json` | 1.0 | Serialisation for DB fields |
+| `serde` | 1.0 | Config/data serialization |
 | `chrono` | 0.4 | Timestamps |
 | `log` + `env_logger` | 0.4 / 0.11 | Structured logging |
+| `toml` | 0.8 | Persisting runtime config to a TOML file |
+| `parking_lot` | 0.12 | Faster non-poisoning mutexes |
+| `arc-swap` | 1.7 | Lock-free reads for the latest snapshot |
 
 > **SQLite portability:** `rusqlite` is compiled with the `bundled` feature, so no system
 > SQLite installation is required. Switching to PostgreSQL requires only replacing the
 > `database.rs` layer with `sqlx` + a `postgres` feature flag.
+
+---
+
+## 🧪 Testing
+
+The project currently includes unit tests for the risk engine covering:
+- PID reuse safety for memory leak detection
+- deduplication of repeated alerts
+- network-threshold correctness for different monitoring intervals
+- exact-name matching for dual-use suspicious tools
+- positive memory leak detection
+
+Run them with:
+
+```bash
+cargo test
+```
 
 ---
 
@@ -262,8 +297,8 @@ without restarting the application. Changes take effect on the next monitoring c
 - The application reads system metrics using standard OS APIs and requires **no elevated
   privileges** on Linux/macOS for basic operation.
 - Temperature sensor access may require the `lm-sensors` kernel modules to be loaded on Linux.
-- The suspicious-process detection is heuristic (name-pattern matching) and is **not** a
-  substitute for a real endpoint-detection solution.
+- Suspicious-process detection is heuristic and intentionally distinguishes between
+  **critical malware-like indicators** and **medium-severity dual-use tools**.
 - The SQLite database is stored unencrypted; do not store this file in a publicly readable
   location.
 
@@ -271,13 +306,14 @@ without restarting the application. Changes take effect on the next monitoring c
 
 ## 🗺 Roadmap
 
-- [ ] Persist and restore `AppConfig` to/from a TOML file
 - [ ] PostgreSQL backend via `sqlx`
 - [ ] Export alerts to CSV / JSON
 - [ ] Desktop notifications (OS toast) for Critical alerts
 - [ ] Process kill button from the Processes panel
 - [ ] Plugin system for custom risk rules
 - [ ] Docker / systemd service mode (headless, metrics-only)
+- [ ] Further reduce process-string allocations for 24/7 headless mode
+- [ ] Upgrade `egui` / `eframe` / `sysinfo` to newer major versions
 
 ---
 
